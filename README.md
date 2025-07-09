@@ -38,6 +38,7 @@
     <li><a href="#built-with">Built&nbsp;With</a></li>
     <li><a href="#getting-started">Getting&nbsp;Started</a></li>
     <li><a href="#usage">Usage</a></li>
+    <li><a href="#screenshot">Screenshot</a></li>
     <li><a href="#roadmap">Roadmap</a></li>
     <li><a href="#contributing">Contributing</a></li>
     <li><a href="#license">License</a></li>
@@ -152,7 +153,19 @@ pyinstaller streamtray.spec         # dist/StreamTray.exe
 
 <p align="right">(<a href="#top">back to top</a>)</p>
 
----
+## Screenshot
+
+<p align="center">
+  <img src="docs/tray_icon.PNG" width="280">
+  <img src="docs/tray_menu.PNG"  width="450">
+</p>
+<p align="center">
+  <img src="docs/notification.PNG" width="280">
+  <img src="docs/rtsp_list.PNG"  width="430">
+</p>
+<p align="center">
+  <img src="docs/example.jpeg" width="720">
+</p>
 
 ## Roadmap
 
