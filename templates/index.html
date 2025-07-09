@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>StreamTray – Live Preview</title>
+
+  <style>
+    /* Reset base */
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      width: 100%;
+      font-family: system-ui, sans-serif;
+      background: #111;
+      color: #eee;
+      overflow: hidden;
+    }
+
+    /* Griglia fluida: tante colonne quante ne entrano */
+    #grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      grid-auto-rows: minmax(160px, 1fr);
+      gap: 8px;
+      height: 100%;
+      padding: 8px;
+      box-sizing: border-box;
+    }
+
+    /* Ogni flusso mantiene rapporto 16:9, riempie la cella */
+    .stream {
+      position: relative;
+      width: 100%;
+      padding-top: 56.25%;          /* 16:9 */
+      overflow: hidden;
+      border-radius: 6px;
+      box-shadow: 0 0 8px rgba(0,0,0,.6);
+      background: #000;
+    }
+    .stream img {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;            /* ridimensiona senza deformare */
+    }
+
+    /* Etichetta con l’ID della camera */
+    .label {
+      position: absolute;
+      bottom: 4px;
+      left: 6px;
+      background: rgba(0,0,0,.6);
+      padding: 2px 6px;
+      font-size: .8rem;
+      border-radius: 3px;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="grid">
+    {# Flask inserisce qui i flussi dal DB #}
+    {% for cam in rtsp_urls %}
+      <div class="stream">
+        <img src="{{ url_for('video_feed', camera_id=cam['camera_id']) }}" alt="Stream {{ cam['camera_id'] }}" />
+        <span class="label">{{ cam['camera_id'] }}</span>
+      </div>
+    {% endfor %}
+  </div>
+</body>
+</html>

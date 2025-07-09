@@ -1,0 +1,6 @@
+pystray
+flask
+opencv-python
+waitress
+pillow
+imutils
