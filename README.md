@@ -1,4 +1,4 @@
-### README — **StreamTray v 2.0.1**
+### README — **StreamTray**
 
 <div id="top"></div>
 
@@ -15,7 +15,7 @@
     <img src="app.png" alt="StreamTray logo" width="96" height="96">
   </a>
 
-  <h3 align="center">StreamTray&nbsp;2.0.1</h3>
+  <h3 align="center">StreamTray</h3>
 
   <p align="center">
     Tiny Python tray-server that converts any <strong>RTSP</strong> camera/DVR<br>
