@@ -157,10 +157,10 @@ pyinstaller --onefile --windowed --icon=app.ico --add-data "app.png;." --add-dat
 
 <p align="center">
   <img src="docs/tray_icon.png" width="280">
-  <img src="docs/tray_menu.png"  width="450">
+  <img src="docs/tray_menu.png"  width="380">
 </p>
 <p align="center">
-  <img src="docs/notification.png" width="280">
+  <img src="docs/notification.png" width="340">
   <img src="docs/rtsp_list.png"  width="430">
 </p>
 <p align="center">
