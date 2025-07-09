@@ -128,7 +128,7 @@ python -m pip install -r requirements.txt
 python streamtray.py --debug        # localhost:5000
 
 # optional – build single .exe (Windows)
-pyinstaller streamtray.spec         # dist/StreamTray.exe
+pyinstaller --onefile --windowed --icon=app.ico --add-data "app.png;." --add-data "rtsp_streams.db;."  --add-data "templates\\index.html;templates" --clean main.py         # dist/StreamTray.exe
 ```
 
 > **Firewall tip** – allow inbound TCP 5000 so other devices can reach
