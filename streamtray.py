@@ -1,18 +1,12 @@
-"""
-StreamTray – RTSP → MJPEG con tray-icon e DB SQLite
-Versione thread-safe: un thread per camera, chiusura auto quando non serve più
-"""
 from pathlib import Path
 import sys, os, threading, time, signal, shutil, uuid, logging, webbrowser, sqlite3
 from collections import deque
 
 # ── librerie terze parti ────────────────────────────────────────────────────
-from flask import Flask, Response, jsonify, abort
+from flask import Flask, Response, jsonify, abort, request, redirect, url_for
 import cv2
 from PIL import Image
 import waitress
-import tkinter as tk
-from tkinter import ttk
 from pystray import Icon, Menu, MenuItem
 
 TARGET_FPS  = 30
@@ -108,22 +102,141 @@ def worker_for(cam_id: str, rtsp_url: str):
         w = _workers.get(cam_id)
         if not w:
             w = _workers[cam_id] = CameraWorker(rtsp_url)
+        # Update URL if changed (basic support)
+        if w.url != rtsp_url:
+            w.url = rtsp_url
         return w
+
+def reload_workers():
+    """Ricarica la cache degli URL dal DB per essere sicuri."""
+    load_rtsp_streams_from_db()
 
 # ── Flask app ───────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
-@app.route("/api/streams")
-def api_streams():
-    rows = q("SELECT camera_id FROM rtsp_streams")
-    return jsonify({"streams": [{"id": r["camera_id"], "name": r["camera_id"]} for r in rows]})
+# Cache dict {camera_id: rtsp_url}
+rtsp_urls: dict[str, str] = {}
+
+def load_rtsp_streams_from_db():
+    rtsp_urls.clear()
+    for r in q("SELECT camera_id, rtsp_url FROM rtsp_streams"):
+        rtsp_urls[r["camera_id"]] = r["rtsp_url"]
+
+load_rtsp_streams_from_db()
+
+@app.route("/")
+def index():
+    if not rtsp_urls:
+         # Se non ci sono stream, ricarica per sicurezza
+         load_rtsp_streams_from_db()
+    # Passiamo la lista direttamente al template
+    streams = [{"id": k, "url": v} for k, v in rtsp_urls.items()]
+    return flask_render_template("index.html", rtsp_urls=streams)
+
+# Helper per renderizzare template senza import render_template se non necessario o per chiarezza
+from flask import render_template as flask_render_template
+
+@app.route("/api/streams", methods=["GET"])
+def api_get_streams():
+    load_rtsp_streams_from_db()
+    return jsonify([{"id": k, "url": v} for k, v in rtsp_urls.items()])
+
+@app.route("/api/streams", methods=["POST"])
+def api_add_stream():
+    data = request.json
+    if not data or "url" not in data:
+        return jsonify({"error": "Missing 'url'"}), 400
+
+    url = data["url"].strip()
+    if not url:
+        return jsonify({"error": "Empty URL"}), 400
+
+    cam_id = str(uuid.uuid4())
+    q("INSERT INTO rtsp_streams (camera_id, rtsp_url) VALUES (?,?)", (cam_id, url))
+    load_rtsp_streams_from_db()
+    return jsonify({"id": cam_id, "url": url}), 201
+
+@app.route("/api/streams/<cam_id>", methods=["DELETE"])
+def api_delete_stream(cam_id):
+    q("DELETE FROM rtsp_streams WHERE camera_id=?", (cam_id,))
+    load_rtsp_streams_from_db()
+    # Fermiamo eventuali worker attivi
+    with _workers_lock:
+        if cam_id in _workers:
+            # Forziamo stop se necessario, o lasciamo che il GC/unsubscribe faccia il suo corso
+            # Qui ci limitiamo a rimuoverlo dalla mappa per evitare riutilizzo errato
+            _workers.pop(cam_id, None)
+
+    return jsonify({"status": "deleted"})
+
+@app.route("/api/streams/<cam_id>", methods=["PUT"])
+def api_update_stream(cam_id):
+    data = request.json
+    if not data or "url" not in data:
+        return jsonify({"error": "Missing 'url'"}), 400
+
+    new_url = data["url"].strip()
+    q("UPDATE rtsp_streams SET rtsp_url=? WHERE camera_id=?", (new_url, cam_id))
+    load_rtsp_streams_from_db()
+
+    # Aggiorna worker esistente se c'è
+    with _workers_lock:
+        if cam_id in _workers:
+            _workers[cam_id].url = new_url
+
+    return jsonify({"id": cam_id, "url": new_url})
+
+
+@app.route("/api/snapshot/<cam_id>")
+def api_snapshot(cam_id):
+    # Se non è in cache, riprova a caricare
+    if cam_id not in rtsp_urls:
+        load_rtsp_streams_from_db()
+
+    if cam_id not in rtsp_urls:
+        abort(404, "Camera not found")
+
+    w = worker_for(cam_id, rtsp_urls[cam_id])
+    # Assicuriamo che il worker sia attivo per almeno un frame
+    # (In uno scenario reale snapshot-only, servirebbe una logica di "keep-alive" meno aggressiva,
+    # ma qui usiamo subscribe/unsubscribe rapido o ci affidiamo al fatto che se è "latest" lo prendiamo)
+
+    # Per semplicità: se il worker non sta girando, lo avviamo un attimo?
+    # Meglio: se vogliamo snapshot periodici, i worker dovrebbero essere sempre attivi
+    # o attivati on-demand. Dato il requisito "microserver", attiviamolo se spento via subscribe.
+
+    # Nota: se usiamo snapshot per la griglia, il worker deve restare attivo per aggiornare il buffer.
+    # Quindi la griglia farà "keep-alive" implicitamente chiedendo snapshot.
+    # Tuttavia CameraWorker ha un timeout o logica di stop?
+    # Nel codice attuale: unsubscribe() ferma se views==0.
+    # Dobbiamo gestire questo. Per ora facciamo una subscribe "temporanea".
+
+    w.subscribe()
+    try:
+        # Attendiamo un attimo se il buffer è vuoto (worker appena partito)
+        for _ in range(20):
+            frame = w.latest()
+            if frame is not None: break
+            time.sleep(0.05)
+
+        if frame is None:
+            abort(503, "No frame available")
+
+        _, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+        return Response(buf.tobytes(), mimetype="image/jpeg")
+    finally:
+        w.unsubscribe()
 
 @app.route("/video_feed/<cam_id>")
 def video_feed(cam_id):
-    row = q("SELECT rtsp_url FROM rtsp_streams WHERE camera_id=?", (cam_id,))
-    if not row: abort(404, "Camera not found")
+    # Se non è in cache, riprova a caricare
+    if cam_id not in rtsp_urls:
+        load_rtsp_streams_from_db()
 
-    w = worker_for(cam_id, row[0]["rtsp_url"])
+    if cam_id not in rtsp_urls:
+        abort(404, "Camera not found")
+
+    w = worker_for(cam_id, rtsp_urls[cam_id])
     w.subscribe()
 
     def stream():
@@ -141,128 +254,35 @@ def video_feed(cam_id):
 
     return Response(stream(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
-# ----------------------------------------------------------------------------
-# Cache dict {camera_id: rtsp_url}
-# ----------------------------------------------------------------------------
-rtsp_urls: dict[str, str] = {}
 
-def load_rtsp_streams_from_db():
-    rtsp_urls.clear()
-    for r in q("SELECT camera_id, rtsp_url FROM rtsp_streams"):
-        rtsp_urls[r["camera_id"]] = r["rtsp_url"]
+# ── Tray + server thread ────────────────────────────────────────────────────
 
-load_rtsp_streams_from_db()
+def open_dashboard(icon=None, item=None):
+    webbrowser.open("http://localhost:5050/")
 
-# ----------------------------------------------------------------------------
-# GUI Tk per gestire RTSP
-# ----------------------------------------------------------------------------
+def run_flask():
+    waitress.serve(app, host="0.0.0.0", port=5050, expose_tracebacks=True, threads=6)
 
-def manage_rtsp_streams(icon=None, item=None):
+def start_background_server():
+    t = threading.Thread(target=run_flask, daemon=True)
+    t.start()
+    return t
 
-    def refresh_tree():
-        tree.delete(*tree.get_children())
-        for r in q("SELECT camera_id, rtsp_url FROM rtsp_streams"):
-            tree.insert("", "end", values=(r["camera_id"], r["rtsp_url"]))
-        load_rtsp_streams_from_db()
-
-    def add_stream():
-        url = entry_url.get().strip()
-        if url:
-            cam = str(uuid.uuid4())
-            q("INSERT INTO rtsp_streams (camera_id, rtsp_url) VALUES (?,?)", (cam, url))
-            entry_url.delete(0, tk.END)
-            refresh_tree()
-
-    def update_stream():
-        sel = tree.selection()
-        if sel:
-            cam_id = tree.item(sel[0], "values")[0]
-            new_url = entry_url.get().strip()
-            if new_url:
-                q("UPDATE rtsp_streams SET rtsp_url=? WHERE camera_id=?", (new_url, cam_id))
-                refresh_tree()
-
-    def remove_selected():
-        for item_id in tree.selection():
-            cam_id = tree.item(item_id, "values")[0]
-            q("DELETE FROM rtsp_streams WHERE camera_id=?", (cam_id,))
-        refresh_tree()
-
-    def on_tree_select(_):
-        sel = tree.selection()
-        if sel:
-            entry_url.delete(0, tk.END)
-            entry_url.insert(0, tree.item(sel[0], "values")[1])
-
-    def copy_url(_=None):
-        sel = tree.selection()
-        if sel:
-            root.clipboard_clear()
-            root.clipboard_append(tree.item(sel[0], "values")[1])
-
-    root = tk.Tk(); root.title("Gestione RTSP Streams"); root.resizable(False, False)
-    if ICON_FILE.exists():
-        root.iconbitmap(str(ICON_FILE))
-
-    cols = ("Camera ID", "RTSP URL")
-    frame_tree = ttk.Frame(root); frame_tree.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
-    tree = ttk.Treeview(frame_tree, columns=cols, show="headings", displaycolumns=("RTSP URL",), height=10)
-    tree.heading("RTSP URL", text="RTSP URL")
-    tree.column("Camera ID", width=0, stretch=False)
-    tree.column("RTSP URL", width=450, anchor=tk.W)
-    vsb = ttk.Scrollbar(frame_tree, orient="vertical", command=tree.yview)
-    tree.configure(yscrollcommand=vsb.set)
-    tree.grid(row=0, column=0, sticky="nsew"); vsb.grid(row=0, column=1, sticky="ns")
-    frame_tree.grid_rowconfigure(0, weight=1); frame_tree.grid_columnconfigure(0, weight=1)
-
-    tree.bind("<<TreeviewSelect>>", on_tree_select)
-    tree.bind("<Double-1>", copy_url); root.bind_all("<Control-c>", copy_url)
-
-    frame_ctrl = ttk.Frame(root); frame_ctrl.pack(padx=10, pady=(0,10), fill=tk.X)
-    ttk.Label(frame_ctrl, text="RTSP URL:").grid(row=0, column=0, sticky=tk.W)
-    entry_url = ttk.Entry(frame_ctrl, width=60); entry_url.grid(row=0, column=1, padx=(0,10))
-    ttk.Button(frame_ctrl, text="Aggiungi", command=add_stream).grid(row=0, column=2, padx=(0,5))
-    ttk.Button(frame_ctrl, text="Aggiorna selezionato", command=update_stream).grid(row=0, column=3, padx=(0,5))
-    ttk.Button(frame_ctrl, text="Rimuovi selezionato", command=remove_selected).grid(row=0, column=4)
-
-    refresh_tree(); root.mainloop()
-
-# ----------------------------------------------------------------------------
-# Tray + server thread
-# ----------------------------------------------------------------------------
-
-def open_first_stream(icon=None, item=None):
-    row = q("SELECT camera_id FROM rtsp_streams ORDER BY id LIMIT 1")
-    url = f"http://localhost:5000/video_feed/{row[0]['camera_id']}" if row else "http://localhost:5000/"
-    webbrowser.open(url)
-
-
-def start_server(icon=None, item=None):
-    def run_flask():
-        waitress.serve(app, host="0.0.0.0", port=5000, expose_tracebacks=True, threads=4)
-    threading.Thread(target=run_flask, daemon=True).start()
-    icon.notify("StreamTray avviato", "StreamTray")
-    log.info("Waitress listening on 0.0.0.0:5000")
-
-
-def exit_all(icon=None, item=None):
-    icon.stop(); os.kill(os.getpid(), signal.SIGTERM)
-
-def start_server(icon=None, item=None):
-    threading.Thread(
-        target=lambda: waitress.serve(app, host="0.0.0.0", port=5000,
-                                      expose_tracebacks=True, threads=4),
-        daemon=True).start()
-    icon.notify("StreamTray avviato", "StreamTray")
-    log.info("Waitress listening on 0.0.0.0:5000")
-
-# ── bootstrap (tray oppure debug senza tray) ─────────────────────────────────
+# ── bootstrap ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--debug":
-        app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)
+    # Avvia subito il server in background
+    start_background_server()
+    log.info("Server started on http://localhost:5050")
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--no-tray":
+        # Modalità solo server (utile per debug o docker)
+        try:
+            while True: time.sleep(1)
+        except KeyboardInterrupt:
+            pass
     else:
+        # Modalità Tray
         Icon("StreamTray", Image.open(IMAGE_FILE), "StreamTray", Menu(
-            MenuItem("Start server", start_server),
-            MenuItem("Gestisci RTSP Streams", manage_rtsp_streams),
-            MenuItem("Chiudi", lambda i, _: (i.stop(), os.kill(os.getpid(), signal.SIGTERM)))
+            MenuItem("Open Dashboard", open_dashboard),
+            MenuItem("Quit", lambda i, _: (i.stop(), os.kill(os.getpid(), signal.SIGTERM)))
         )).run()
