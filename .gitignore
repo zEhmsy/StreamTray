@@ -3,3 +3,5 @@
 build
 dist
 insert_db.py
+build_mac.sh
+StreamTray.spec

@@ -15,10 +15,13 @@ BUF_LEN     = 4          # frame mantenuti in memoria per ogni cam
 # ── percorsi e logging ──────────────────────────────────────────────────────
 if getattr(sys, "frozen", False):
     RES_DIR  = Path(sys._MEIPASS)
-    DATA_DIR = Path(sys.executable).parent
+    # Use standard macOS Application Support for persistence
+    DATA_DIR = Path.home() / "Library" / "Application Support" / "StreamTray"
 else:
     RES_DIR  = Path(__file__).resolve().parent
     DATA_DIR = RES_DIR
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 ICON_FILE, IMAGE_FILE = RES_DIR / "app.ico", RES_DIR / "app.png"
 DB_FILE               = DATA_DIR / "rtsp_streams.db"
