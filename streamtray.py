@@ -40,7 +40,14 @@ def q(sql, args=()):
 
 q("""CREATE TABLE IF NOT EXISTS rtsp_streams (
        id INTEGER PRIMARY KEY AUTOINCREMENT,
-       camera_id TEXT, rtsp_url TEXT)""")
+       camera_id TEXT, rtsp_url TEXT, name TEXT DEFAULT '')""")
+
+# Migration helper: ensure 'name' column exists
+try:
+    q("SELECT name FROM rtsp_streams LIMIT 1")
+except sqlite3.OperationalError:
+    log.info("Migrating DB: adding 'name' column")
+    q("ALTER TABLE rtsp_streams ADD COLUMN name TEXT DEFAULT ''")
 
 # ── CameraWorker: un thread di cattura per cam ──────────────────────────────
 class CameraWorker:
@@ -142,23 +149,23 @@ def reload_workers():
 # ── Flask app ───────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
-# Cache dict {camera_id: rtsp_url}
-rtsp_urls: dict[str, str] = {}
+# Cache dict {camera_id: {"url": str, "name": str}}
+rtsp_streams: dict[str, dict] = {}
 
 def load_rtsp_streams_from_db():
-    rtsp_urls.clear()
-    for r in q("SELECT camera_id, rtsp_url FROM rtsp_streams"):
-        rtsp_urls[r["camera_id"]] = r["rtsp_url"]
+    rtsp_streams.clear()
+    for r in q("SELECT camera_id, rtsp_url, name FROM rtsp_streams"):
+        rtsp_streams[r["camera_id"]] = {"url": r["rtsp_url"], "name": r["name"]}
 
 load_rtsp_streams_from_db()
 
 @app.route("/")
 def index():
-    if not rtsp_urls:
-         # Se non ci sono stream, ricarica per sicurezza
+    if not rtsp_streams:
          load_rtsp_streams_from_db()
     # Passiamo la lista direttamente al template
-    streams = [{"id": k, "url": v} for k, v in rtsp_urls.items()]
+    # Structure: [{"id":..., "url":..., "name":...}]
+    streams = [{"id": k, "url": v["url"], "name": v["name"]} for k, v in rtsp_streams.items()]
     return flask_render_template("index.html", rtsp_urls=streams)
 
 # Helper per renderizzare template senza import render_template se non necessario o per chiarezza
@@ -167,7 +174,7 @@ from flask import render_template as flask_render_template
 @app.route("/api/streams", methods=["GET"])
 def api_get_streams():
     load_rtsp_streams_from_db()
-    return jsonify([{"id": k, "url": v} for k, v in rtsp_urls.items()])
+    return jsonify([{"id": k, "url": v["url"], "name": v["name"]} for k, v in rtsp_streams.items()])
 
 @app.route("/api/streams", methods=["POST"])
 def api_add_stream():
@@ -176,13 +183,15 @@ def api_add_stream():
         return jsonify({"error": "Missing 'url'"}), 400
 
     url = data["url"].strip()
+    name = data.get("name", "").strip() # Optional name
+
     if not url:
         return jsonify({"error": "Empty URL"}), 400
 
     cam_id = str(uuid.uuid4())
-    q("INSERT INTO rtsp_streams (camera_id, rtsp_url) VALUES (?,?)", (cam_id, url))
+    q("INSERT INTO rtsp_streams (camera_id, rtsp_url, name) VALUES (?,?,?)", (cam_id, url, name))
     load_rtsp_streams_from_db()
-    return jsonify({"id": cam_id, "url": url}), 201
+    return jsonify({"id": cam_id, "url": url, "name": name}), 201
 
 @app.route("/api/streams/<cam_id>", methods=["DELETE"])
 def api_delete_stream(cam_id):
@@ -204,7 +213,9 @@ def api_update_stream(cam_id):
         return jsonify({"error": "Missing 'url'"}), 400
 
     new_url = data["url"].strip()
-    q("UPDATE rtsp_streams SET rtsp_url=? WHERE camera_id=?", (new_url, cam_id))
+    new_name = data.get("name", "").strip()
+
+    q("UPDATE rtsp_streams SET rtsp_url=?, name=? WHERE camera_id=?", (new_url, new_name, cam_id))
     load_rtsp_streams_from_db()
 
     # Aggiorna worker esistente se c'è
@@ -212,18 +223,18 @@ def api_update_stream(cam_id):
         if cam_id in _workers:
             _workers[cam_id].url = new_url
 
-    return jsonify({"id": cam_id, "url": new_url})
+    return jsonify({"id": cam_id, "url": new_url, "name": new_name})
 
 
 @app.route("/api/snapshot/<cam_id>")
 def api_snapshot(cam_id):
-    if cam_id not in rtsp_urls:
+    if cam_id not in rtsp_streams:
         load_rtsp_streams_from_db()
 
-    if cam_id not in rtsp_urls:
+    if cam_id not in rtsp_streams:
         abort(404, "Camera not found")
 
-    w = worker_for(cam_id, rtsp_urls[cam_id])
+    w = worker_for(cam_id, rtsp_streams[cam_id]["url"])
 
     # "Keep alive" logic: ensure it runs briefly for a snapshot
     w.subscribe()
@@ -244,12 +255,12 @@ def api_snapshot(cam_id):
 
 @app.route("/video_feed/<cam_id>")
 def video_feed(cam_id):
-    if cam_id not in rtsp_urls:
+    if cam_id not in rtsp_streams:
         load_rtsp_streams_from_db()
-    if cam_id not in rtsp_urls:
+    if cam_id not in rtsp_streams:
         abort(404, "Camera not found")
 
-    w = worker_for(cam_id, rtsp_urls[cam_id])
+    w = worker_for(cam_id, rtsp_streams[cam_id]["url"])
     w.subscribe()
 
     def stream():
