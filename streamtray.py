@@ -46,30 +46,55 @@ q("""CREATE TABLE IF NOT EXISTS rtsp_streams (
 class CameraWorker:
     def __init__(self, url: str):
         self.url  = url
-        self.buf  = deque(maxlen=BUF_LEN)
         self.lock = threading.Lock()
         self.views = 0
         self.stop = threading.Event()
         self.th   = None
 
+        # Optimization: Centralized caching
+        self.latest_jpeg = None
+        self.frame_id    = 0
+        self.max_width   = 1280 # Downscale 4K streams for performance
+
     def _loop(self):
-        delay = 1 / TARGET_FPS
-        # forza TCP e 1 MB di buffer
+        # UDP-like approach: capture & encode as fast as possible (or capped FPS)
+        # Clients just pick the latest. If they are slow, they skip frames.
+
+        # forcing TCP for reliability of transport, but we handle "drops" logically
         url = f"{self.url}?rtsp_transport=tcp&buffer_size=1048576"
 
         cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
         if not cap.isOpened():
             log.error("Impossibile aprire %s", url); return
 
+        fps_delay = 1 / TARGET_FPS
+
         while not self.stop.is_set():
             t0 = time.time()
             ok, frame = cap.read()
             if not ok:
-                log.warning("Frame perso su %s", url)
-                continue  # mantiene vivo il loop
+                log.warning("Frame perso su %s", self.url)
+                time.sleep(1) # Prevent busy loop on loss
+                # Try reconnect? For now just loop.
+                if not cap.isOpened(): break
+                continue
 
-            self.buf.append(frame)
-            s = delay - (time.time() - t0)
+            # 1. Resize if huge (Performance)
+            h, w = frame.shape[:2]
+            if w > self.max_width:
+                scale = self.max_width / w
+                frame = cv2.resize(frame, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+
+            # 2. Centralized Encoding (Critical Optimization)
+            # Encode ONCE here, not in every client thread
+            ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
+            if ok:
+                with self.lock:
+                    self.latest_jpeg = buf.tobytes()
+                    self.frame_id   += 1
+
+            # Cap FPS to save CPU
+            s = fps_delay - (time.time() - t0)
             if s > 0: time.sleep(s)
 
         cap.release()
@@ -91,8 +116,10 @@ class CameraWorker:
             if self.views == 0:
                 self.stop.set()
 
-    def latest(self):
-        return self.buf[-1] if self.buf else None
+    def get_frame(self):
+        """Returns (frame_id, jpeg_bytes)"""
+        with self.lock:
+            return self.frame_id, self.latest_jpeg
 
 # ── registry {camera_id: worker} ────────────────────────────────────────────
 _workers, _workers_lock = {}, threading.Lock()
@@ -105,6 +132,7 @@ def worker_for(cam_id: str, rtsp_url: str):
         # Update URL if changed (basic support)
         if w.url != rtsp_url:
             w.url = rtsp_url
+            # If running, logic to restart? For now simple update.
         return w
 
 def reload_workers():
@@ -189,7 +217,6 @@ def api_update_stream(cam_id):
 
 @app.route("/api/snapshot/<cam_id>")
 def api_snapshot(cam_id):
-    # Se non è in cache, riprova a caricare
     if cam_id not in rtsp_urls:
         load_rtsp_streams_from_db()
 
@@ -197,42 +224,28 @@ def api_snapshot(cam_id):
         abort(404, "Camera not found")
 
     w = worker_for(cam_id, rtsp_urls[cam_id])
-    # Assicuriamo che il worker sia attivo per almeno un frame
-    # (In uno scenario reale snapshot-only, servirebbe una logica di "keep-alive" meno aggressiva,
-    # ma qui usiamo subscribe/unsubscribe rapido o ci affidiamo al fatto che se è "latest" lo prendiamo)
 
-    # Per semplicità: se il worker non sta girando, lo avviamo un attimo?
-    # Meglio: se vogliamo snapshot periodici, i worker dovrebbero essere sempre attivi
-    # o attivati on-demand. Dato il requisito "microserver", attiviamolo se spento via subscribe.
-
-    # Nota: se usiamo snapshot per la griglia, il worker deve restare attivo per aggiornare il buffer.
-    # Quindi la griglia farà "keep-alive" implicitamente chiedendo snapshot.
-    # Tuttavia CameraWorker ha un timeout o logica di stop?
-    # Nel codice attuale: unsubscribe() ferma se views==0.
-    # Dobbiamo gestire questo. Per ora facciamo una subscribe "temporanea".
-
+    # "Keep alive" logic: ensure it runs briefly for a snapshot
     w.subscribe()
     try:
-        # Attendiamo un attimo se il buffer è vuoto (worker appena partito)
-        for _ in range(20):
-            frame = w.latest()
-            if frame is not None: break
+        # Wait up to 2s for a frame if just started
+        frame_bytes = None
+        for _ in range(40):
+            _, frame_bytes = w.get_frame()
+            if frame_bytes is not None: break
             time.sleep(0.05)
 
-        if frame is None:
+        if frame_bytes is None:
             abort(503, "No frame available")
 
-        _, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-        return Response(buf.tobytes(), mimetype="image/jpeg")
+        return Response(frame_bytes, mimetype="image/jpeg")
     finally:
         w.unsubscribe()
 
 @app.route("/video_feed/<cam_id>")
 def video_feed(cam_id):
-    # Se non è in cache, riprova a caricare
     if cam_id not in rtsp_urls:
         load_rtsp_streams_from_db()
-
     if cam_id not in rtsp_urls:
         abort(404, "Camera not found")
 
@@ -240,13 +253,23 @@ def video_feed(cam_id):
     w.subscribe()
 
     def stream():
+        last_id = -1
         try:
             while True:
-                frame = w.latest()
-                if frame is None: time.sleep(0.02); continue
-                _, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" +
-                       buf.tobytes() + b"\r\n")
+                # 1. Get latest frame (O(1) operation)
+                fid, jpeg = w.get_frame()
+
+                # 2. Deduplication: only send if new
+                if fid > last_id and jpeg:
+                    last_id = fid
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" +
+                           jpeg + b"\r\n")
+                    # No sleep needed here usually as get_frame is non-blocking
+                    # IF we are faster than FPS, next loop hits "if fid > last_id" check.
+
+                # 3. Throttle checking slightly to save CPU
+                time.sleep(1.0 / (TARGET_FPS + 5))
+
         except GeneratorExit:
             pass
         finally:
